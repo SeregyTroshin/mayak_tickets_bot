@@ -5,6 +5,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _safe_int(val: str | None) -> int:
+    try:
+        return int(val) if val else 0
+    except ValueError:
+        return 0
+
+
 @dataclass
 class Person:
     name: str
@@ -14,7 +21,7 @@ class Person:
 @dataclass
 class Config:
     bot_token: str = os.getenv("BOT_TOKEN", "")
-    admin_id: int = int(os.getenv("ADMIN_ID") or "0")
+    admin_id: int = field(default_factory=lambda: _safe_int(os.getenv("ADMIN_ID")))
 
     # sportvsegda.ru
     base_url: str = "https://sportvsegda.ru"
