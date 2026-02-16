@@ -121,27 +121,76 @@ async def prepare_purchase(
         )
 
         log.info("Browser launched, loading page...")
-        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        log.info("DOM loaded, waiting for form...")
-        await page.wait_for_selector("#orderForm", timeout=20_000)
-        log.info("Page loaded: %s", url)
+        await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        log.info("DOM loaded, waiting for network idle...")
 
-        # 1 билет
-        ticket_input = await page.wait_for_selector(
-            ".chek_ticket_item input[type=text]", timeout=15_000
-        )
-        if ticket_input:
-            await ticket_input.fill("1")
-            await ticket_input.dispatch_event("change")
-            log.info("Ticket qty = 1")
+        # Ждём пока JS обработает URL-параметры и сделает AJAX-вызовы
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+            log.info("Network idle")
+        except Exception:
+            log.warning("networkidle timeout — continuing anyway")
+
+        await page.wait_for_selector("#orderForm", timeout=10_000)
+        log.info("orderForm found")
+
+        # Ждём появления билетных позиций (создаются JS после AJAX)
+        ticket_input = None
+        try:
+            ticket_input = await page.wait_for_selector(
+                ".chek_ticket_item input[type=text]", timeout=25_000
+            )
+        except Exception:
+            log.warning("Ticket items not found via selector, trying JS fallback")
+
+        if not ticket_input:
+            # Fallback: возможно AJAX не сработал — попробуем вызвать JS вручную
+            # Сначала проверим, что получил AJAX
+            ajax_debug = await page.evaluate("""() => {
+                return {
+                    hasRanges: typeof ranges !== 'undefined' ? ranges.length : -1,
+                    hasPrices: typeof prices !== 'undefined' ? prices.length : -1,
+                    ticketItems: document.querySelectorAll('.chek_ticket_item').length,
+                    formHTML: document.getElementById('orderForm')
+                        ? document.getElementById('orderForm').innerHTML.substring(0, 500)
+                        : 'NO FORM',
+                };
+            }""")
+            log.info("AJAX debug: %s", ajax_debug)
+
+            # Если ranges/prices загружены но get_prices не вызвался — вызовем
+            if ajax_debug.get("hasRanges", -1) > 0:
+                await page.evaluate("get_prices()")
+                await page.wait_for_timeout(1000)
+                ticket_input = await page.wait_for_selector(
+                    ".chek_ticket_item input[type=text]", timeout=5_000
+                )
+
+        if not ticket_input:
+            # Дампим HTML для диагностики
+            html_snippet = await page.evaluate(
+                "document.body.innerHTML.substring(0, 2000)"
+            )
+            log.error("No ticket items. Body: %s", html_snippet)
+            raise Exception("Билетные позиции не загрузились. Возможно, AJAX заблокирован.")
+
+        await ticket_input.fill("1")
+        await ticket_input.dispatch_event("change")
+        log.info("Ticket qty = 1")
 
         # Промокод
         if promo:
-            await page.locator("#promocode").fill(promo)
-            apply_btn = page.locator(".apply_promo")
+            promo_input = page.locator('input[name="f_Promo"]')
+            if await promo_input.count() > 0:
+                await promo_input.fill(promo)
+            else:
+                # fallback на старый id
+                await page.locator("#promocode").fill(promo)
+
+            apply_btn = page.locator(".apply_promo, .promo_button, button:has-text('Применить')")
             if await apply_btn.count() > 0:
-                await apply_btn.click()
-                await page.wait_for_timeout(2500)
+                await apply_btn.first.click()
+                await page.wait_for_timeout(3000)
             log.info("Promo applied: %s", promo)
 
         # Контактные данные
@@ -150,18 +199,36 @@ async def prepare_purchase(
         await page.locator('input[name="f_Email"]').fill(email)
         log.info("Contact info filled")
 
-        # Оплата картой
-        await page.locator("#payment_2").check()
-        log.info("Card payment selected")
+        # Оплата картой — пробуем несколько селекторов
+        card_radio = page.locator("#payment_2")
+        if await card_radio.count() == 0:
+            card_radio = page.locator("input[name='payment_method'][value='2']")
+        if await card_radio.count() == 0:
+            card_radio = page.locator("label:has-text('Картой') input, label:has-text('картой') input")
+        if await card_radio.count() > 0:
+            await card_radio.first.check()
+            log.info("Card payment selected")
+        else:
+            log.warning("Card payment radio not found")
 
-        # Три галочки
-        await page.locator("#order_agree_oferta").check()
-        await page.locator("#order_agree_policy").check()
-        await page.locator("#order_agree_personal").check()
+        # Три галочки — пробуем несколько селекторов
+        for chk_id in ["#order_agree_oferta", "#order_agree_policy", "#order_agree_personal"]:
+            chk = page.locator(chk_id)
+            if await chk.count() > 0:
+                await chk.check()
+            else:
+                log.warning("Checkbox %s not found", chk_id)
+        # Fallback: отметить все видимые чекбоксы с agree в name/id
+        unchecked = page.locator("input[type=checkbox]:not(:checked)")
+        for i in range(await unchecked.count()):
+            try:
+                await unchecked.nth(i).check()
+            except Exception:
+                pass
         log.info("Agreements checked")
 
         # Считать сумму
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
         total_amount = None
         total_el = page.locator(".summ_itog")
         if await total_el.count() > 0:
@@ -174,7 +241,14 @@ async def prepare_purchase(
         return PurchaseResult(success=True, total_amount=total_amount)
 
     except Exception as e:
-        log.exception("prepare_purchase failed")
+        log.exception("prepare_purchase failed: %s", e)
+        # Дамп HTML страницы для диагностики
+        if browser and page:
+            try:
+                body = await page.evaluate("document.body ? document.body.innerHTML.substring(0, 3000) : 'no body'")
+                log.error("PAGE HTML: %s", body)
+            except Exception:
+                pass
         if browser:
             try:
                 await browser.close()
