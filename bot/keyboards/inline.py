@@ -65,6 +65,13 @@ def buy_link_keyboard(url: str, date: str, time_range: str) -> InlineKeyboardMar
     return builder.as_markup()
 
 
+def cancel_keyboard(date: str, time_range: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Отмена", callback_data=f"cancel_purchase|{date}|{time_range}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Посмотреть сеансы", callback_data="show:dates")

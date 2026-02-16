@@ -32,6 +32,10 @@ class Config:
     customer_name: str = "Katerina"
     customer_email: str = "Katerina.troshina@gmail.com"
 
+    # Карта для оплаты
+    card_number: str = "2202206859839834"
+    card_expiry: str = "02/34"  # MM/YY
+
     # Люди и промокоды
     persons: list[Person] = field(default_factory=lambda: [
         Person(name="Тренер", promo="Shalaeva761o"),
