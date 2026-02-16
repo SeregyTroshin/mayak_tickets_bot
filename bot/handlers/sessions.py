@@ -32,6 +32,7 @@ _schedule_cache: dict = {}
 
 class PurchaseStates(StatesGroup):
     waiting_cvc = State()
+    waiting_sms = State()
 
 
 def _buy_url(date: str, time_range: str) -> str:
@@ -279,7 +280,6 @@ async def select_person(callback: CallbackQuery, state: FSMContext):
 async def process_cvc(message: Message, state: FSMContext):
     cvc = message.text.strip()
 
-    # Валидация CVC
     if not cvc.isdigit() or len(cvc) != 3:
         await message.answer(
             "CVC должен быть 3 цифры. Попробуйте ещё раз, или нажмите Отмена."
@@ -287,13 +287,12 @@ async def process_cvc(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    await state.clear()
-
     person_idx = data["person_idx"]
     date = data["date"]
     time_range = data["time_range"]
     person = config.persons[person_idx]
 
+    await state.clear()
     await message.answer("Оплачиваю...")
 
     from bot.services.purchase import confirm_and_pay
@@ -304,6 +303,54 @@ async def process_cvc(message: Message, state: FSMContext):
         card_expiry=config.card_expiry,
         card_cvv=cvc,
     )
+
+    await _handle_payment_result(message, state, result, person, date, time_range, person_idx)
+
+
+# ─── Ввод SMS-кода 3D-Secure ────────────────────────────────────────────────
+
+
+@router.message(PurchaseStates.waiting_sms)
+async def process_sms(message: Message, state: FSMContext):
+    sms_code = message.text.strip()
+
+    if not sms_code.isdigit() or len(sms_code) < 4 or len(sms_code) > 8:
+        await message.answer(
+            "Введите код из SMS (4-8 цифр), или нажмите Отмена."
+        )
+        return
+
+    data = await state.get_data()
+    person_idx = data["person_idx"]
+    date = data["date"]
+    time_range = data["time_range"]
+    person = config.persons[person_idx]
+
+    await message.answer("Отправляю код подтверждения...")
+
+    from bot.services.purchase import complete_3ds
+
+    result = await complete_3ds(
+        user_id=message.from_user.id,
+        sms_code=sms_code,
+    )
+
+    await _handle_payment_result(message, state, result, person, date, time_range, person_idx)
+
+
+# ─── Общая обработка результата оплаты ───────────────────────────────────────
+
+
+async def _handle_payment_result(
+    message: Message,
+    state: FSMContext,
+    result,
+    person,
+    date: str,
+    time_range: str,
+    person_idx: int,
+):
+    """Обработать результат confirm_and_pay или complete_3ds."""
 
     if result.success:
         builder = InlineKeyboardBuilder()
@@ -331,9 +378,25 @@ async def process_cvc(message: Message, state: FSMContext):
             promo=person.promo,
             status="paid",
         )
+        return
 
-    elif result.payment_url:
-        # 3DS или не удалось автоматически
+    if result.needs_sms:
+        # 3D-Secure — браузер жив, просим SMS-код
+        error = result.error or "Банк запросил код из SMS."
+        await message.answer(
+            f"{error}\n\n"
+            "Введите код из SMS для подтверждения оплаты:",
+            reply_markup=cancel_keyboard(date, time_range),
+        )
+        await state.set_state(PurchaseStates.waiting_sms)
+        await state.update_data(
+            person_idx=person_idx,
+            date=date,
+            time_range=time_range,
+        )
+        return
+
+    if result.payment_url:
         builder = InlineKeyboardBuilder()
         builder.button(text="Открыть для оплаты", url=result.payment_url)
         builder.button(
@@ -360,31 +423,31 @@ async def process_cvc(message: Message, state: FSMContext):
             promo=person.promo,
             status="payment_link",
         )
+        return
 
-    else:
-        # Ошибка
-        builder = InlineKeyboardBuilder()
-        builder.button(
-            text="Попробовать снова",
-            callback_data=f"session:{date}|{time_range}",
-        )
-        builder.button(text="<< В начало", callback_data="show:dates")
-        builder.adjust(1)
+    # Ошибка
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Попробовать снова",
+        callback_data=f"session:{date}|{time_range}",
+    )
+    builder.button(text="<< В начало", callback_data="show:dates")
+    builder.adjust(1)
 
-        error = result.error or "Неизвестная ошибка"
-        await message.answer(
-            f"Ошибка оплаты: {error}",
-            reply_markup=builder.as_markup(),
-        )
+    error = result.error or "Неизвестная ошибка"
+    await message.answer(
+        f"Ошибка оплаты: {error}",
+        reply_markup=builder.as_markup(),
+    )
 
-        await save_order(
-            user_id=message.from_user.id,
-            date=date,
-            time_range=time_range,
-            person_name=person.name,
-            promo=person.promo,
-            status="error",
-        )
+    await save_order(
+        user_id=message.from_user.id,
+        date=date,
+        time_range=time_range,
+        person_name=person.name,
+        promo=person.promo,
+        status="error",
+    )
 
 
 # ─── Кнопка «Отмена» во время ожидания CVC ──────────────────────────────────

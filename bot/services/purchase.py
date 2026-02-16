@@ -1,19 +1,23 @@
-"""Двухфазная автоматизация покупки билетов через Playwright.
+"""Трёхфазная автоматизация покупки билетов через Playwright.
 
 Фаза 1 — prepare_purchase:
   Открыть страницу → 1 билет → промокод → контакты → оплата картой →
-  галочки → прочитать сумму → вернуть сумму, держать браузер открытым.
+  галочки → прочитать сумму.  Браузер остаётся открытым.
 
 Фаза 2 — confirm_and_pay:
   Нажать «Оплатить» → перейти на страницу банка →
-  заполнить номер карты, срок, CVV → отправить → проверить результат.
+  заполнить карту → отправить.
+  Если 3D-Secure — браузер остаётся открытым, needs_sms=True.
+
+Фаза 3 — complete_3ds:
+  Ввести SMS-код на странице 3D-Secure → дождаться результата.
 
 cancel_purchase — закрыть браузер, очистить сессию.
 """
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
 log = logging.getLogger(__name__)
@@ -31,24 +35,26 @@ class PurchaseResult:
     payment_url: str | None = None
     error: str | None = None
     total_amount: str | None = None
+    needs_sms: bool = False
 
 
 class PurchaseSession:
-    """Хранит состояние браузера между фазами prepare и confirm."""
+    """Хранит состояние браузера между фазами."""
 
-    def __init__(self, pw, browser, page, total_amount: str | None):
+    def __init__(self, pw, browser, page, total_amount: str | None, user_id: int):
         self.pw = pw
         self.browser = browser
         self.page = page
         self.total_amount = total_amount
+        self.user_id = user_id
         self._cleanup_task: asyncio.Task | None = asyncio.create_task(
             self._auto_cleanup()
         )
 
     async def _auto_cleanup(self):
         await asyncio.sleep(SESSION_TTL)
-        log.info("Auto-cleaning purchase session")
-        _sessions.pop(id(self), None)  # remove if still there
+        log.info("Auto-cleaning purchase session for user %d", self.user_id)
+        _sessions.pop(self.user_id, None)
         await self.close()
 
     async def close(self):
@@ -64,7 +70,7 @@ class PurchaseSession:
             pass
 
 
-# ─── Phase 1 ────────────────────────────────────────────────────────────────
+# ─── Phase 1: подготовка ────────────────────────────────────────────────────
 
 
 async def prepare_purchase(
@@ -79,7 +85,6 @@ async def prepare_purchase(
 ) -> PurchaseResult:
     """Заполнить форму, прочитать сумму.  Браузер остаётся открытым."""
 
-    # Закрыть предыдущую сессию, если есть
     await cancel_purchase(user_id)
 
     try:
@@ -108,12 +113,11 @@ async def prepare_purchase(
             )
         )
 
-        # 1. Загрузить страницу
         await page.goto(url, wait_until="networkidle", timeout=30_000)
         await page.wait_for_selector("#orderForm", timeout=10_000)
         log.info("Page loaded: %s", url)
 
-        # 2. 1 билет
+        # 1 билет
         ticket_input = await page.wait_for_selector(
             ".chek_ticket_item input[type=text]", timeout=15_000
         )
@@ -122,7 +126,7 @@ async def prepare_purchase(
             await ticket_input.dispatch_event("change")
             log.info("Ticket qty = 1")
 
-        # 3. Промокод
+        # Промокод
         if promo:
             await page.locator("#promocode").fill(promo)
             apply_btn = page.locator(".apply_promo")
@@ -131,23 +135,23 @@ async def prepare_purchase(
                 await page.wait_for_timeout(2500)
             log.info("Promo applied: %s", promo)
 
-        # 4. Контактные данные
+        # Контактные данные
         await page.locator('input[name="f_Name"]').fill(name)
         await page.locator('input[name="f_Phone"]').fill(phone)
         await page.locator('input[name="f_Email"]').fill(email)
         log.info("Contact info filled")
 
-        # 5. Оплата картой (value=2)
+        # Оплата картой
         await page.locator("#payment_2").check()
         log.info("Card payment selected")
 
-        # 6. Три галочки
+        # Три галочки
         await page.locator("#order_agree_oferta").check()
         await page.locator("#order_agree_policy").check()
         await page.locator("#order_agree_personal").check()
         log.info("Agreements checked")
 
-        # 7. Считать итоговую сумму (подождать пересчёт JS)
+        # Считать сумму
         await page.wait_for_timeout(1500)
         total_amount = None
         total_el = page.locator(".summ_itog")
@@ -155,8 +159,7 @@ async def prepare_purchase(
             total_amount = (await total_el.text_content() or "").strip()
         log.info("Total: %s", total_amount)
 
-        # Сохранить сессию
-        session = PurchaseSession(pw, browser, page, total_amount)
+        session = PurchaseSession(pw, browser, page, total_amount, user_id)
         _sessions[user_id] = session
 
         return PurchaseResult(success=True, total_amount=total_amount)
@@ -175,7 +178,7 @@ async def prepare_purchase(
         return PurchaseResult(success=False, error=str(e))
 
 
-# ─── Phase 2 ────────────────────────────────────────────────────────────────
+# ─── Phase 2: оплата картой ─────────────────────────────────────────────────
 
 
 async def confirm_and_pay(
@@ -184,7 +187,10 @@ async def confirm_and_pay(
     card_expiry: str,
     card_cvv: str,
 ) -> PurchaseResult:
-    """Нажать «Оплатить», перейти на страницу банка, заполнить карту."""
+    """Нажать «Оплатить», заполнить карту на странице банка.
+
+    Если 3D-Secure — браузер остаётся открытым, needs_sms=True.
+    """
 
     session = _sessions.pop(user_id, None)
     if not session:
@@ -204,8 +210,8 @@ async def confirm_and_pay(
         await submit.first.click()
         log.info("Submit clicked")
 
-        # Ждём перехода на другой URL (прямой redirect или JS)
-        for _ in range(60):  # 30 сек
+        # Ждём перехода на другой URL
+        for _ in range(60):
             await page.wait_for_timeout(500)
             if page.url != original_url:
                 break
@@ -214,9 +220,8 @@ async def confirm_and_pay(
         bank_url = page.url
         log.info("After submit: %s", bank_url)
 
-        # Если остались на sportvsegda.ru — форма могла вернуть ошибку
+        # Если остались на sportvsegda.ru — ошибка
         if "sportvsegda.ru" in bank_url:
-            # Попробуем найти сообщение об ошибке на странице
             content = await page.content()
             if "ошибк" in content.lower() or "error" in content.lower():
                 return PurchaseResult(
@@ -224,7 +229,6 @@ async def confirm_and_pay(
                     error="Сайт вернул ошибку при оформлении заказа.",
                     total_amount=total,
                 )
-            # Возможно, ещё перенаправляется
             await page.wait_for_timeout(5000)
             bank_url = page.url
             if "sportvsegda.ru" in bank_url:
@@ -234,13 +238,12 @@ async def confirm_and_pay(
                     total_amount=total,
                 )
 
-        # ── Заполнить карту на странице банка ──
+        # ── Заполнить карту ──
         log.info("Bank page: %s", bank_url)
-        await page.wait_for_timeout(3000)  # дать банку загрузить JS
+        await page.wait_for_timeout(3000)
 
         filled = await _fill_card(page, card_number, card_expiry, card_cvv)
         if not filled:
-            # Не удалось заполнить — вернуть ссылку для ручной оплаты
             return PurchaseResult(
                 success=False,
                 payment_url=bank_url,
@@ -248,11 +251,11 @@ async def confirm_and_pay(
                 total_amount=total,
             )
 
-        # ── Нажать «Оплатить» на банковской странице ──
+        # ── Нажать «Оплатить» ──
         await _submit_payment(page)
-        log.info("Payment submitted")
+        log.info("Payment submitted on bank page")
 
-        # Ждём результата
+        # ── Ждём результат: успех, 3DS, или ошибка ──
         for _ in range(40):  # 20 сек
             await page.wait_for_timeout(500)
             current = page.url
@@ -260,23 +263,22 @@ async def confirm_and_pay(
             low = (current + body).lower()
 
             # Успех
-            if any(w in low for w in ("success", "ok", "paid", "успешно", "оплачен")):
+            if any(w in low for w in ("success", "paid", "успешно", "оплачен")):
                 log.info("Payment SUCCESS")
                 return PurchaseResult(success=True, total_amount=total)
 
-            # 3D-Secure — нужен SMS-код, автоматизировать нельзя
-            if any(
-                w in low for w in ("3ds", "3-d secure", "введите код", "sms")
-            ):
-                log.info("3DS detected, returning URL")
+            # 3D-Secure — держим браузер, просим SMS
+            if _is_3ds_page(low):
+                log.info("3DS detected — keeping browser for SMS")
+                _sessions[user_id] = session
                 return PurchaseResult(
                     success=False,
-                    payment_url=current,
-                    error="Требуется 3D-Secure (SMS). Откройте ссылку и введите код.",
                     total_amount=total,
+                    needs_sms=True,
+                    error="Банк запросил код из SMS для подтверждения.",
                 )
 
-        # Не дождались явного результата
+        # Таймаут
         final_url = page.url
         return PurchaseResult(
             success=False,
@@ -289,7 +291,111 @@ async def confirm_and_pay(
         log.exception("confirm_and_pay failed")
         return PurchaseResult(success=False, error=str(e), total_amount=total)
     finally:
-        await session.close()
+        # Закрыть браузер, ТОЛЬКО если сессия не была сохранена обратно (3DS)
+        if user_id not in _sessions:
+            await session.close()
+
+
+# ─── Phase 3: ввод SMS-кода 3D-Secure ───────────────────────────────────────
+
+
+async def complete_3ds(user_id: int, sms_code: str) -> PurchaseResult:
+    """Ввести SMS-код на странице 3D-Secure и дождаться результата."""
+
+    session = _sessions.pop(user_id, None)
+    if not session:
+        return PurchaseResult(
+            success=False, error="Сессия 3DS истекла. Начните покупку заново."
+        )
+
+    page = session.page
+    total = session.total_amount
+
+    try:
+        log.info("Entering 3DS code for user %d", user_id)
+
+        # Найти поле для SMS-кода
+        code_filled = await _try_fill(page, _SMS_CODE_SELECTORS, sms_code)
+
+        if not code_filled:
+            # Проверить iframe
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                try:
+                    code_filled = await _try_fill(frame, _SMS_CODE_SELECTORS, sms_code)
+                    if code_filled:
+                        break
+                except Exception:
+                    continue
+
+        if not code_filled:
+            log.warning("SMS code field not found")
+            return PurchaseResult(
+                success=False,
+                payment_url=page.url,
+                error="Не нашёл поле для SMS-кода. Откройте ссылку.",
+                total_amount=total,
+            )
+
+        log.info("SMS code entered")
+
+        # Нажать кнопку подтверждения
+        await _submit_3ds(page)
+        log.info("3DS submit clicked")
+
+        # Ждём результат
+        for _ in range(60):  # 30 сек
+            await page.wait_for_timeout(500)
+            current = page.url
+            body = await page.content()
+            low = (current + body).lower()
+
+            # Успех
+            if any(w in low for w in ("success", "paid", "успешно", "оплачен")):
+                log.info("3DS payment SUCCESS")
+                return PurchaseResult(success=True, total_amount=total)
+
+            # Неверный код
+            if any(w in low for w in ("неверный", "incorrect", "invalid", "wrong", "повторите")):
+                log.info("Wrong SMS code")
+                # Оставить сессию для повторной попытки
+                _sessions[user_id] = session
+                return PurchaseResult(
+                    success=False,
+                    needs_sms=True,
+                    error="Неверный код. Попробуйте ещё раз.",
+                    total_amount=total,
+                )
+
+            # Ошибка
+            if any(w in low for w in ("отклонен", "declined", "fail", "ошибк")):
+                log.info("Payment declined after 3DS")
+                return PurchaseResult(
+                    success=False,
+                    error="Платёж отклонён банком.",
+                    total_amount=total,
+                )
+
+        # Таймаут — проверим ещё раз
+        final_url = page.url
+        final_body = await page.content()
+        if any(w in (final_url + final_body).lower() for w in ("success", "успешно", "оплачен")):
+            return PurchaseResult(success=True, total_amount=total)
+
+        return PurchaseResult(
+            success=False,
+            payment_url=final_url,
+            error="Не удалось определить результат 3DS. Проверьте по ссылке.",
+            total_amount=total,
+        )
+
+    except Exception as e:
+        log.exception("complete_3ds failed")
+        return PurchaseResult(success=False, error=str(e), total_amount=total)
+    finally:
+        if user_id not in _sessions:
+            await session.close()
 
 
 # ─── Cancel ──────────────────────────────────────────────────────────────────
@@ -302,7 +408,7 @@ async def cancel_purchase(user_id: int) -> None:
         log.info("Purchase session cancelled for user %d", user_id)
 
 
-# ─── Helpers: заполнение карты ───────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 _CARD_SELECTORS = [
     'input[name="pan"]',
@@ -341,6 +447,42 @@ _CVV_SELECTORS = [
     "#cvc",
 ]
 
+_SMS_CODE_SELECTORS = [
+    'input[name="password"]',
+    'input[autocomplete="one-time-code"]',
+    'input[name*="code"]',
+    'input[name*="otp"]',
+    'input[name*="sms"]',
+    'input[placeholder*="Код"]',
+    'input[placeholder*="код"]',
+    'input[placeholder*="SMS"]',
+    'input[placeholder*="Code"]',
+    'input[type="tel"]',
+    'input[type="password"]',
+    'input[data-field="code"]',
+    "#otp",
+    "#code",
+    "#smsCode",
+]
+
+
+def _is_3ds_page(text_lower: str) -> bool:
+    """Определить, находимся ли мы на странице 3D-Secure."""
+    indicators = [
+        "3-d secure",
+        "3ds",
+        "3d secure",
+        "введите код",
+        "enter code",
+        "одноразовый пароль",
+        "sms-код",
+        "код подтверждения",
+        "confirmation code",
+        "secure code",
+        "код из сообщения",
+    ]
+    return any(ind in text_lower for ind in indicators)
+
 
 async def _try_fill(target, selectors: list[str], value: str) -> bool:
     """Попробовать заполнить поле по списку селекторов."""
@@ -357,9 +499,9 @@ async def _try_fill(target, selectors: list[str], value: str) -> bool:
 
 
 async def _fill_card(page, card_number: str, card_expiry: str, card_cvv: str) -> bool:
-    """Заполнить карту на странице банка. Поддержка нескольких шлюзов."""
+    """Заполнить карту на странице банка."""
 
-    # Проверить, есть ли iframe с платёжной формой
+    # Проверить iframe
     target = page
     for frame in page.frames:
         if frame == page.main_frame:
@@ -373,7 +515,6 @@ async def _fill_card(page, card_number: str, card_expiry: str, card_cvv: str) ->
         except Exception:
             continue
 
-    # Номер карты
     card_ok = await _try_fill(target, _CARD_SELECTORS, card_number)
     if not card_ok:
         log.warning("Card number field not found")
@@ -381,9 +522,8 @@ async def _fill_card(page, card_number: str, card_expiry: str, card_cvv: str) ->
 
     await page.wait_for_timeout(500)
 
-    # Срок действия — сначала единое поле, потом раздельные month/year
+    # Срок — единое поле или раздельные month/year
     expiry_ok = await _try_fill(target, _EXPIRY_SELECTORS, card_expiry.replace("/", ""))
-
     if not expiry_ok:
         parts = card_expiry.split("/")
         if len(parts) == 2:
@@ -405,12 +545,9 @@ async def _fill_card(page, card_number: str, card_expiry: str, card_cvv: str) ->
 
     await page.wait_for_timeout(500)
 
-    # CVV
     cvv_ok = await _try_fill(target, _CVV_SELECTORS, card_cvv)
 
-    log.info(
-        "Card fill: number=%s expiry=%s cvv=%s", card_ok, expiry_ok, cvv_ok
-    )
+    log.info("Card fill: number=%s expiry=%s cvv=%s", card_ok, expiry_ok, cvv_ok)
     return card_ok and cvv_ok
 
 
@@ -436,3 +573,41 @@ async def _submit_payment(page) -> None:
         except Exception:
             continue
     log.warning("Payment submit button not found")
+
+
+async def _submit_3ds(page) -> None:
+    """Нажать кнопку подтверждения на странице 3D-Secure."""
+    for sel in [
+        'input[type="submit"]',
+        'button[type="submit"]',
+        "button:has-text('Подтвердить')",
+        "button:has-text('Отправить')",
+        "button:has-text('Submit')",
+        "button:has-text('Confirm')",
+        "button:has-text('OK')",
+        "#buttonSubmit",
+        ".submit",
+    ]:
+        try:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                await el.first.click()
+                log.info("Clicked 3DS submit: %s", sel)
+                return
+        except Exception:
+            continue
+
+    # Fallback: попробовать во фреймах
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        for sel in ['input[type="submit"]', 'button[type="submit"]']:
+            try:
+                el = frame.locator(sel)
+                if await el.count() > 0:
+                    await el.first.click()
+                    log.info("Clicked 3DS submit in iframe: %s", sel)
+                    return
+            except Exception:
+                continue
+    log.warning("3DS submit button not found")
