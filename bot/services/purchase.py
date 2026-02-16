@@ -151,194 +151,151 @@ async def prepare_purchase(
         await page.wait_for_timeout(5000)
         log.info("Filling form via JS evaluate...")
 
-        # ── Всё заполняем через один page.evaluate() ──
-        # Это быстрее и надёжнее чем ждать AJAX страницы:
-        # мы сами делаем fetch(), парсим ответ, заполняем DOM.
+        # ── Заполняем форму через page.evaluate() ──
+        # Страница сама загружает ticket items через свой JS (не через AJAX API).
+        # Мы ждём появления элементов и заполняем их.
         js_result = await page.evaluate("""async (args) => {
             const {stadiumId, date, timeRange, promo, name, phone, email} = args;
             const log = [];
 
             try {
-                // 1. AJAX: получить сеансы и цены
-                const resp = await fetch(
-                    '/assets/ajax/get_ranges_hockey.php?stadium='
-                    + stadiumId + '&date=' + encodeURIComponent(date)
-                    + '&promo=' + encodeURIComponent(promo || '')
-                );
-                const data = await resp.json();
-                log.push('AJAX: ranges=' + (data.Ranges||[]).length
-                         + ' prices=' + (data.TicketPrices||[]).length);
-
-                if (!data.Ranges || data.Ranges.length === 0) {
-                    // AJAX пустой — попробуем подождать пока страница сама загрузит
-                    log.push('AJAX empty, waiting for page JS...');
-                    for (let i = 0; i < 20; i++) {
-                        await new Promise(r => setTimeout(r, 1000));
-                        const ti = document.querySelector('.chek_ticket_item input[type=text]');
-                        if (ti) {
-                            log.push('Page JS loaded ticket items after ' + (i+1) + 's');
-                            // Страница сама заполнила — работаем с тем что есть
-                            ti.value = '1';
-                            ti.dispatchEvent(new Event('change'));
-                            // Заполняем остальное и выходим
-                            if (promo) {
-                                const pi = document.querySelector('input[name="f_Promo"]')
-                                         || document.querySelector('#promocode');
-                                if (pi) pi.value = promo;
-                                const btn = document.querySelector('.apply_promo');
-                                if (btn) { btn.click(); await new Promise(r => setTimeout(r, 2000)); }
+                // 1. Ждём пока страница загрузит ticket items (до 15 сек)
+                let ticketInput = null;
+                for (let i = 0; i < 15; i++) {
+                    // Ищем любой input внутри .chek_ticket_item (может быть type=text, number, или без type)
+                    const items = document.querySelectorAll('.chek_ticket_item');
+                    if (items.length > 0) {
+                        // Ищем input внутри .number div или напрямую
+                        for (const item of items) {
+                            const inp = item.querySelector('.number input')
+                                     || item.querySelector('input');
+                            if (inp) {
+                                ticketInput = inp;
+                                break;
                             }
-                            const fN = document.querySelector('input[name="f_Name"]');
-                            const fP = document.querySelector('input[name="f_Phone"]');
-                            const fE = document.querySelector('input[name="f_Email"]');
-                            if (fN) fN.value = name;
-                            if (fP) fP.value = phone;
-                            if (fE) fE.value = email;
-                            const cr = document.querySelector('#payment_2')
-                                || document.querySelector('input[name="payment_method"][value="2"]');
-                            if (cr) cr.checked = true;
-                            document.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true);
-                            await new Promise(r => setTimeout(r, 1000));
-                            const tot = document.querySelector('.summ_itog');
-                            return {success: true, total: tot ? tot.textContent.trim() : '?', log};
                         }
-                    }
-                    // Так и не появились
-                    const bodySnip = document.body ? document.body.innerHTML.substring(0, 500) : 'no body';
-                    return {error: 'Билеты не загрузились (AJAX пустой, страница не заполнила)', log, html: bodySnip};
-                }
-
-                // 2. Найти нужный сеанс
-                let target = null;
-                for (const r of data.Ranges) {
-                    if (r.NameRange === timeRange) { target = r; break; }
-                }
-                if (!target) {
-                    const names = data.Ranges.map(r => r.NameRange).join(', ');
-                    return {error: 'Сеанс "' + timeRange + '" не найден. Есть: ' + names, log};
-                }
-                log.push('Range found: type=' + target.Type
-                         + ' avail=' + target.AvailableTiickets);
-
-                // 3. Найти цену билета для этого типа
-                const prices = data.TicketPrices || [];
-                let ticket = null;
-                for (const p of prices) {
-                    const pType = (p.Type == 10) ? 1 : p.Type;
-                    if (pType == target.Type) { ticket = p; break; }
-                }
-                if (!ticket) {
-                    return {error: 'Нет цены для типа ' + target.Type, log};
-                }
-                log.push('Ticket: id=' + ticket.IDService
-                         + ' name=' + ticket.NameService
-                         + ' price=' + ticket.Price);
-
-                // 4. Установить глобальные переменные страницы
-                window.ranges = data.Ranges;
-                window.prices = prices;
-                window.promo_quantity = data.PromoQuantity || 100;
-
-                // 5. Установить dropdown сеанса и вызвать get_prices()
-                const $range = document.querySelector('#order_range');
-                if ($range) {
-                    // Добавить option если нет
-                    let found = false;
-                    for (const opt of $range.options) {
-                        if (opt.value === timeRange) {
-                            opt.selected = true;
-                            opt.dataset.type = target.Type;
-                            found = true;
+                        if (ticketInput) {
+                            log.push('Found ticket input after ' + (i+1) + 's, type=' + ticketInput.type + ' name=' + ticketInput.name);
                             break;
                         }
+                        log.push('Items found (' + items.length + ') but no input inside, waiting...');
                     }
-                    if (!found) {
-                        const opt = new Option(timeRange, timeRange, true, true);
-                        opt.dataset.type = String(target.Type);
-                        $range.add(opt);
-                    }
+                    await new Promise(r => setTimeout(r, 1000));
                 }
 
-                if (typeof get_prices === 'function') {
-                    get_prices();
-                    log.push('get_prices() called');
-                }
-
-                await new Promise(r => setTimeout(r, 500));
-
-                // 6. Установить количество = 1
-                const ticketInput = document.querySelector(
-                    '.chek_ticket_item input[type=text]'
-                );
-                if (ticketInput) {
-                    ticketInput.value = '1';
-                    ticketInput.dispatchEvent(new Event('change'));
-                    log.push('Ticket qty = 1');
-                } else {
-                    // Fallback: создать поле вручную
-                    const main = document.querySelector('.chek_ticket_main');
-                    if (main) {
-                        main.innerHTML =
-                            '<div class="chek_ticket_item">'
-                            + '<div class="chek_ticket_col1">'
-                            + '<div class="chek_ticket_head">' + ticket.NameService + '</div>'
-                            + '<div class="chek_ticket_price">' + ticket.Price + ' руб.</div>'
-                            + '</div>'
-                            + '<div class="chek_ticket_col2"><div class="number">'
-                            + '<input type="text" name="item[' + ticket.IDService + ']"'
-                            + ' data-id="' + ticket.IDService + '"'
-                            + ' data-name="' + ticket.NameService + '"'
-                            + ' data-price="' + ticket.Price + '"'
-                            + ' data-max="' + target.AvailableTiickets + '"'
-                            + ' value="1"/>'
-                            + '</div></div></div>';
-                        const inp = main.querySelector('input');
-                        if (inp) inp.dispatchEvent(new Event('change'));
-                        log.push('Ticket item created manually');
+                if (!ticketInput) {
+                    // Последняя попытка — любой input в .chek_ticket_main
+                    const mainInp = document.querySelector('.chek_ticket_main input');
+                    if (mainInp) {
+                        ticketInput = mainInp;
+                        log.push('Fallback: found input in .chek_ticket_main');
                     } else {
-                        return {error: 'Нет .chek_ticket_main и нет ticket input', log};
+                        const itemsHtml = document.querySelector('.chek_ticket_main')
+                            ? document.querySelector('.chek_ticket_main').innerHTML.substring(0, 500)
+                            : 'no .chek_ticket_main';
+                        return {error: 'Ticket input не найден', log, html: itemsHtml};
                     }
                 }
 
-                // 7. Промокод
-                if (promo) {
-                    const pi = document.querySelector('input[name="f_Promo"]')
-                             || document.querySelector('#promocode');
-                    if (pi) pi.value = promo;
+                // 2. Установить количество = 1
+                // Используем nativeInputValueSetter для React-like элементов
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(ticketInput, '1');
+                ticketInput.dispatchEvent(new Event('input', {bubbles: true}));
+                ticketInput.dispatchEvent(new Event('change', {bubbles: true}));
+                log.push('Ticket qty set to 1');
 
-                    const btn = document.querySelector('.apply_promo')
-                             || document.querySelector('.promo_button');
-                    if (btn) {
-                        btn.click();
-                        await new Promise(r => setTimeout(r, 2000));
-                        log.push('Promo applied via button');
-                    }
-                }
-
-                // 8. Контактные данные
-                const fName = document.querySelector('input[name="f_Name"]');
-                const fPhone = document.querySelector('input[name="f_Phone"]');
-                const fEmail = document.querySelector('input[name="f_Email"]');
-                if (fName) fName.value = name;
-                if (fPhone) fPhone.value = phone;
-                if (fEmail) fEmail.value = email;
-                log.push('Contact filled');
-
-                // 9. Оплата картой
-                const cardRadio = document.querySelector('#payment_2')
-                    || document.querySelector('input[name="payment_method"][value="2"]');
-                if (cardRadio) { cardRadio.checked = true; log.push('Card selected'); }
-
-                // 10. Все чекбоксы
-                document.querySelectorAll('input[type=checkbox]').forEach(
-                    cb => { cb.checked = true; }
-                );
-                log.push('Checkboxes checked');
-
-                // 11. Пересчёт суммы
+                // Подождать обработку
                 await new Promise(r => setTimeout(r, 1000));
-                const totalEl = document.querySelector('.summ_itog');
-                const total = totalEl ? totalEl.textContent.trim() : (ticket.Price + ' руб.');
+
+                // 3. Промокод
+                if (promo) {
+                    const promoInput = document.querySelector('input[name="f_Promo"]')
+                                    || document.querySelector('#promocode')
+                                    || document.querySelector('input[name="promo"]')
+                                    || document.querySelector('.promo input');
+                    if (promoInput) {
+                        nativeSetter.call(promoInput, promo);
+                        promoInput.dispatchEvent(new Event('input', {bubbles: true}));
+                        promoInput.dispatchEvent(new Event('change', {bubbles: true}));
+                        log.push('Promo entered: ' + promo);
+                    } else {
+                        log.push('Promo input NOT FOUND');
+                    }
+
+                    // Нажать кнопку применить промокод
+                    const promoBtn = document.querySelector('.apply_promo')
+                                  || document.querySelector('.promo_button')
+                                  || document.querySelector('button.promo')
+                                  || document.querySelector('[onclick*="promo"]');
+                    if (promoBtn) {
+                        promoBtn.click();
+                        await new Promise(r => setTimeout(r, 2000));
+                        log.push('Promo button clicked');
+                    } else {
+                        log.push('Promo button NOT FOUND');
+                    }
+                }
+
+                // 4. Контактные данные
+                const fields = {
+                    'f_Name': name,
+                    'f_Phone': phone,
+                    'f_Email': email,
+                };
+                for (const [fieldName, value] of Object.entries(fields)) {
+                    const el = document.querySelector('input[name="' + fieldName + '"]');
+                    if (el) {
+                        nativeSetter.call(el, value);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    } else {
+                        log.push('Field ' + fieldName + ' NOT FOUND');
+                    }
+                }
+                log.push('Contact fields filled');
+
+                // 5. Оплата картой (radio button)
+                const cardRadio = document.querySelector('#payment_2')
+                    || document.querySelector('input[name="payment_method"][value="2"]')
+                    || document.querySelector('input[name="f_PaymentMethod"][value="2"]');
+                if (cardRadio) {
+                    cardRadio.checked = true;
+                    cardRadio.dispatchEvent(new Event('change', {bubbles: true}));
+                    cardRadio.click();
+                    log.push('Card payment selected');
+                } else {
+                    log.push('Card radio NOT FOUND');
+                }
+
+                // 6. Все чекбоксы (согласия)
+                let cbCount = 0;
+                document.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                    if (!cb.checked) {
+                        cb.checked = true;
+                        cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        cbCount++;
+                    }
+                });
+                log.push('Checkboxes checked: ' + cbCount);
+
+                // 7. Ждём пересчёта суммы
+                await new Promise(r => setTimeout(r, 1500));
+
+                // 8. Читаем итоговую сумму
+                const totalEl = document.querySelector('.summ_itog')
+                             || document.querySelector('.total')
+                             || document.querySelector('.order-total');
+                const total = totalEl ? totalEl.textContent.trim() : '?';
+                log.push('Total: ' + total);
+
+                // 9. Проверяем кнопку submit
+                const submit = document.querySelector('button[type="submit"]')
+                            || document.querySelector('input[type="submit"]')
+                            || document.querySelector('.order_submit');
+                log.push('Submit btn: ' + (submit ? 'YES' : 'NO'));
 
                 return {success: true, total, log};
 

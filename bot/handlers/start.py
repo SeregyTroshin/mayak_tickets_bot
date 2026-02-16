@@ -90,28 +90,65 @@ async def cmd_debug(message: Message):
 
         # Check page's own JS state
         state = await page.evaluate("""() => {
+            const items = document.querySelectorAll('.chek_ticket_item');
+            const itemsHtml = [];
+            items.forEach((el, i) => itemsHtml.push('ITEM' + i + ': ' + el.innerHTML.substring(0, 300)));
             return {
                 hasRanges: typeof ranges !== 'undefined' ? ranges.length : -1,
                 hasPrices: typeof prices !== 'undefined' ? prices.length : -1,
-                ticketItems: document.querySelectorAll('.chek_ticket_item').length,
+                ticketItems: items.length,
                 webdriver: navigator.webdriver,
+                itemsHtml: itemsHtml,
+                orderFormHtml: document.querySelector('#orderForm') ? document.querySelector('#orderForm').innerHTML.substring(0, 500) : 'no orderForm',
             };
         }""")
-        report.append(f"Page JS state: {json.dumps(state)}")
+        report.append(f"Page JS state: {json.dumps(state, ensure_ascii=False)}")
 
-        # Wait more and check again
-        await page.wait_for_timeout(10000)
-        state2 = await page.evaluate("""() => {
-            return {
-                ticketItems: document.querySelectorAll('.chek_ticket_item').length,
-                hasRanges: typeof ranges !== 'undefined' ? ranges.length : -1,
-            };
+        # Check all inputs inside ticket items
+        inputs_info = await page.evaluate("""() => {
+            const items = document.querySelectorAll('.chek_ticket_item');
+            const result = [];
+            items.forEach((item, i) => {
+                const inputs = item.querySelectorAll('input');
+                inputs.forEach((inp, j) => {
+                    result.push('item' + i + '_inp' + j + ': type=' + inp.type + ' name=' + inp.name + ' class=' + inp.className + ' value=' + inp.value);
+                });
+                // Also check for number div structure
+                const numDiv = item.querySelector('.number');
+                result.push('item' + i + '_numDiv: ' + (numDiv ? numDiv.innerHTML.substring(0, 200) : 'NONE'));
+            });
+            // Check contact fields
+            const fName = document.querySelector('input[name="f_Name"]');
+            const fPhone = document.querySelector('input[name="f_Phone"]');
+            const fEmail = document.querySelector('input[name="f_Email"]');
+            result.push('f_Name: ' + (fName ? 'YES' : 'NO'));
+            result.push('f_Phone: ' + (fPhone ? 'YES' : 'NO'));
+            result.push('f_Email: ' + (fEmail ? 'YES' : 'NO'));
+            // Check promo
+            const promo = document.querySelector('input[name="f_Promo"]') || document.querySelector('#promocode');
+            result.push('promo: ' + (promo ? 'YES tag=' + promo.tagName + ' name=' + promo.name : 'NO'));
+            // Check payment radio
+            const pay2 = document.querySelector('#payment_2');
+            result.push('payment_2: ' + (pay2 ? 'YES type=' + pay2.type : 'NO'));
+            // Check submit
+            const submit = document.querySelector('button[type="submit"], input[type="submit"], .order_submit');
+            result.push('submit: ' + (submit ? 'YES tag=' + submit.tagName + ' text=' + (submit.textContent||'').substring(0, 50) : 'NO'));
+            // Check total
+            const total = document.querySelector('.summ_itog');
+            result.push('summ_itog: ' + (total ? total.textContent : 'NO'));
+            return result;
         }""")
-        report.append(f"After 10s more: {json.dumps(state2)}")
+        report.append(f"Inputs: {json.dumps(inputs_info, ensure_ascii=False)}")
 
-        # Get page HTML snippet
-        html = await page.evaluate("document.body.innerHTML.substring(0, 500)")
-        report.append(f"HTML: {html[:300]}")
+        # Check select#order_range options
+        range_info = await page.evaluate("""() => {
+            const sel = document.querySelector('#order_range');
+            if (!sel) return 'no #order_range';
+            const opts = [];
+            for (const o of sel.options) opts.push(o.value + ' (type=' + (o.dataset.type||'?') + ')');
+            return 'options: ' + opts.join(', ');
+        }""")
+        report.append(f"order_range: {range_info}")
 
         await browser.close()
         await pw.stop()
@@ -119,7 +156,10 @@ async def cmd_debug(message: Message):
     except Exception as e:
         report.append(f"ERROR: {e}")
 
-    await message.answer("Диагностика:\n\n" + "\n".join(report))
+    # Split into chunks of 4000 chars for Telegram limit
+    full_text = "Диагностика:\n\n" + "\n".join(report)
+    for i in range(0, len(full_text), 4000):
+        await message.answer(full_text[i:i+4000])
 
 
 @router.callback_query(F.data == "show:orders")
