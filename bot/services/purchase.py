@@ -151,118 +151,158 @@ async def prepare_purchase(
         await page.wait_for_timeout(5000)
         log.info("Filling form via JS evaluate...")
 
-        # ── Заполняем форму поэтапно через Playwright actions ──
-        # Страница загружает ticket items через свой JS.
-        # Используем клики по кнопкам "+"/"-" для корректной работы JS сайта.
+        # ── Заполняем форму целиком через page.evaluate() ──
+        # Все действия в одном evaluate — не зависает на ожидании видимости.
+        # Кликаем "+" через JS element.click() — триггерит обработчики сайта.
 
-        # Шаг 1: Убедиться что #order_range выбран правильно
-        range_selected = await page.evaluate("""(timeRange) => {
-            const sel = document.querySelector('#order_range');
-            if (!sel) return {error: 'no #order_range'};
-            for (const opt of sel.options) {
-                if (opt.value === timeRange) {
-                    opt.selected = true;
-                    sel.dispatchEvent(new Event('change', {bubbles: true}));
-                    return {ok: true, value: opt.value};
+        js_result = await page.evaluate("""async (args) => {
+            const {timeRange, promo, name, phone, email} = args;
+            const log = [];
+
+            try {
+                // 1. Выбрать нужный сеанс в dropdown
+                const sel = document.querySelector('#order_range');
+                if (sel) {
+                    let found = false;
+                    for (const opt of sel.options) {
+                        if (opt.value === timeRange) {
+                            opt.selected = true;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            found = true;
+                            log.push('Range selected: ' + opt.value);
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        // Выбрать первый доступный сеанс
+                        if (sel.options.length > 0) {
+                            sel.options[0].selected = true;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            log.push('Range fallback to: ' + sel.options[0].value);
+                        }
+                    }
                 }
-            }
-            const opts = Array.from(sel.options).map(o => o.value);
-            return {error: 'Time not found: ' + timeRange, options: opts};
-        }""", time_range)
-        log.info("Range select: %s", range_selected)
 
-        # Вызвать get_prices() если есть — пересчитает цены после смены сеанса
-        await page.evaluate("""() => {
-            if (typeof get_prices === 'function') get_prices();
-        }""")
-        await page.wait_for_timeout(1000)
+                // Вызвать get_prices() если есть
+                if (typeof get_prices === 'function') {
+                    get_prices();
+                    log.push('get_prices() called');
+                }
+                await new Promise(r => setTimeout(r, 1000));
 
-        # Шаг 2: Ждём ticket items и кликаем "+" для первого билета
-        item_found = False
-        for attempt in range(15):
-            plus_btn = page.locator('.chek_ticket_item:first-child .number .plus')
-            count = await plus_btn.count()
-            if count > 0:
-                await plus_btn.first.click()
-                log.info("Clicked '+' button on ticket item (attempt %d)", attempt)
-                item_found = True
-                break
-            await page.wait_for_timeout(1000)
+                // 2. Ждём ticket items (до 10 сек)
+                let plusBtn = null;
+                for (let i = 0; i < 10; i++) {
+                    // Ищем кнопку "+" у первого билета ("Билет на каток")
+                    plusBtn = document.querySelector('.chek_ticket_item .number .plus');
+                    if (plusBtn) {
+                        log.push('Plus btn found after ' + (i+1) + 's');
+                        break;
+                    }
+                    await new Promise(r => setTimeout(r, 1000));
+                }
 
-        if not item_found:
-            # Fallback: попробовать установить значение напрямую
-            log.warning("Plus button not found, trying direct input")
-            fallback = await page.evaluate("""() => {
+                if (plusBtn) {
+                    // Кликаем "+" — сайт сам увеличит количество и пересчитает
+                    plusBtn.click();
+                    log.push('Plus clicked');
+                } else {
+                    // Fallback: ставим value напрямую
+                    const inp = document.querySelector('.chek_ticket_item input');
+                    if (inp) {
+                        inp.value = '1';
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        log.push('Direct input value=1, name=' + inp.name);
+                    } else {
+                        return {error: 'Ни кнопка +, ни input не найдены', log};
+                    }
+                }
+
+                await new Promise(r => setTimeout(r, 1500));
+
+                // 3. Промокод
+                if (promo) {
+                    const pi = document.querySelector('input[name="f_Promo"]');
+                    if (pi) {
+                        pi.value = promo;
+                        pi.dispatchEvent(new Event('input', {bubbles: true}));
+                        log.push('Promo set: ' + promo);
+                    } else {
+                        log.push('Promo input NOT FOUND');
+                    }
+
+                    const btn = document.querySelector('.apply_promo');
+                    if (btn) {
+                        btn.click();
+                        log.push('Promo apply clicked');
+                        await new Promise(r => setTimeout(r, 2000));
+                    } else {
+                        log.push('Promo apply btn NOT FOUND');
+                    }
+                }
+
+                // 4. Контактные данные
+                const setField = (fname, val) => {
+                    const el = document.querySelector('input[name="' + fname + '"]');
+                    if (el) {
+                        el.value = val;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        return true;
+                    }
+                    return false;
+                };
+                setField('f_Name', name);
+                setField('f_Phone', phone);
+                setField('f_Email', email);
+                log.push('Contacts filled');
+
+                // 5. Оплата картой
+                const radio = document.querySelector('#payment_2');
+                if (radio) {
+                    radio.checked = true;
+                    radio.dispatchEvent(new Event('change', {bubbles: true}));
+                    radio.click();
+                    log.push('Card payment selected');
+                } else {
+                    log.push('Card radio NOT FOUND');
+                }
+
+                // 6. Чекбоксы
+                let cbCount = 0;
+                document.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                    if (!cb.checked) {
+                        cb.checked = true;
+                        cb.dispatchEvent(new Event('change', {bubbles: true}));
+                        cbCount++;
+                    }
+                });
+                log.push('Checkboxes: ' + cbCount);
+
+                // 7. Ждём пересчёт суммы
+                await new Promise(r => setTimeout(r, 1500));
+
+                // 8. Итог
+                const totalEl = document.querySelector('.summ_itog');
+                const total = totalEl ? totalEl.textContent.trim() : '?';
+                log.push('Total: ' + total);
+
+                // Проверяем значение input
                 const inp = document.querySelector('.chek_ticket_item input');
-                if (!inp) return {error: 'no input'};
-                inp.value = '1';
-                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                inp.dispatchEvent(new Event('change', {bubbles: true}));
-                return {ok: true, name: inp.name};
-            }""")
-            log.info("Fallback input: %s", fallback)
-            if fallback.get("error"):
-                raise Exception("Ticket input не найден: " + fallback["error"])
+                log.push('Input value: ' + (inp ? inp.value : 'N/A'));
 
-        await page.wait_for_timeout(1000)
+                return {success: true, total, log};
 
-        # Шаг 3: Промокод
-        if promo:
-            promo_input = page.locator('input[name="f_Promo"]')
-            if await promo_input.count() > 0:
-                await promo_input.fill(promo)
-                log.info("Promo filled: %s", promo)
-
-                # Нажать кнопку "Применить"
-                apply_btn = page.locator('.apply_promo')
-                if await apply_btn.count() > 0:
-                    await apply_btn.first.click()
-                    log.info("Promo apply clicked")
-                    await page.wait_for_timeout(2000)
-                else:
-                    log.warning("Promo apply button not found")
-            else:
-                log.warning("Promo input not found")
-
-        # Шаг 4: Контактные данные
-        for field_name, value in [
-            ("f_Name", name),
-            ("f_Phone", phone),
-            ("f_Email", email),
-        ]:
-            field = page.locator(f'input[name="{field_name}"]')
-            if await field.count() > 0:
-                await field.fill(value)
-            else:
-                log.warning("Field %s not found", field_name)
-        log.info("Contact fields filled")
-
-        # Шаг 5: Оплата картой
-        card_radio = page.locator('#payment_2')
-        if await card_radio.count() > 0:
-            await card_radio.click()
-            log.info("Card payment selected")
-        else:
-            log.warning("Card radio #payment_2 not found")
-
-        # Шаг 6: Чекбоксы (согласия)
-        checkboxes = page.locator('input[type=checkbox]')
-        cb_count = await checkboxes.count()
-        for i in range(cb_count):
-            cb = checkboxes.nth(i)
-            if not await cb.is_checked():
-                await cb.check()
-        log.info("Checked %d checkboxes", cb_count)
-
-        # Шаг 7: Прочитать итоговую сумму
-        await page.wait_for_timeout(1500)
-        total_text = await page.evaluate("""() => {
-            const el = document.querySelector('.summ_itog');
-            return el ? el.textContent.trim() : '?';
-        }""")
-        log.info("Total: %s", total_text)
-
-        js_result = {"success": True, "total": total_text, "log": []}
+            } catch (e) {
+                return {error: String(e), log};
+            }
+        }""", {
+            "timeRange": time_range,
+            "promo": promo or "",
+            "name": name,
+            "phone": phone,
+            "email": email,
+        })
 
         js_log = js_result.get("log", [])
         log.info("JS fill result: %s", js_log)
