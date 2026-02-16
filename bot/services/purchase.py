@@ -169,125 +169,99 @@ async def prepare_purchase(
                             opt.selected = true;
                             sel.dispatchEvent(new Event('change', {bubbles: true}));
                             found = true;
-                            log.push('Range selected: ' + opt.value);
+                            log.push('Range: ' + opt.value);
                             break;
                         }
                     }
                     if (!found) {
-                        // Выбрать первый доступный сеанс
                         if (sel.options.length > 0) {
                             sel.options[0].selected = true;
                             sel.dispatchEvent(new Event('change', {bubbles: true}));
-                            log.push('Range fallback to: ' + sel.options[0].value);
+                            log.push('Range fallback: ' + sel.options[0].value);
                         }
                     }
                 }
+                await new Promise(r => setTimeout(r, 500));
 
-                // Вызвать get_prices() если есть
-                if (typeof get_prices === 'function') {
-                    get_prices();
-                    log.push('get_prices() called');
-                }
-                await new Promise(r => setTimeout(r, 1000));
-
-                // 2. Ждём ticket items (до 10 сек)
-                let plusBtn = null;
-                for (let i = 0; i < 10; i++) {
-                    // Ищем кнопку "+" у первого билета ("Билет на каток")
-                    plusBtn = document.querySelector('.chek_ticket_item .number .plus');
-                    if (plusBtn) {
-                        log.push('Plus btn found after ' + (i+1) + 's');
-                        break;
-                    }
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-
-                if (plusBtn) {
-                    // Кликаем "+" — сайт сам увеличит количество и пересчитает
-                    plusBtn.click();
-                    log.push('Plus clicked');
-                } else {
-                    // Fallback: ставим value напрямую
-                    const inp = document.querySelector('.chek_ticket_item input');
-                    if (inp) {
-                        inp.value = '1';
-                        inp.dispatchEvent(new Event('input', {bubbles: true}));
-                        inp.dispatchEvent(new Event('change', {bubbles: true}));
-                        log.push('Direct input value=1, name=' + inp.name);
-                    } else {
-                        return {error: 'Ни кнопка +, ни input не найдены', log};
-                    }
-                }
-
-                await new Promise(r => setTimeout(r, 1500));
-
-                // 3. Промокод
+                // 2. Промокод (ДО выбора количества)
                 if (promo) {
                     const pi = document.querySelector('input[name="f_Promo"]');
                     if (pi) {
                         pi.value = promo;
                         pi.dispatchEvent(new Event('input', {bubbles: true}));
                         log.push('Promo set: ' + promo);
-                    } else {
-                        log.push('Promo input NOT FOUND');
                     }
-
                     const btn = document.querySelector('.apply_promo');
                     if (btn) {
                         btn.click();
                         log.push('Promo apply clicked');
                         await new Promise(r => setTimeout(r, 2000));
-                    } else {
-                        log.push('Promo apply btn NOT FOUND');
                     }
                 }
 
-                // 4. Контактные данные
+                // 3. Контактные данные
                 const setField = (fname, val) => {
                     const el = document.querySelector('input[name="' + fname + '"]');
                     if (el) {
                         el.value = val;
                         el.dispatchEvent(new Event('input', {bubbles: true}));
-                        return true;
                     }
-                    return false;
                 };
                 setField('f_Name', name);
                 setField('f_Phone', phone);
                 setField('f_Email', email);
                 log.push('Contacts filled');
 
-                // 5. Оплата картой
+                // 4. Оплата картой
                 const radio = document.querySelector('#payment_2');
                 if (radio) {
                     radio.checked = true;
                     radio.dispatchEvent(new Event('change', {bubbles: true}));
-                    radio.click();
-                    log.push('Card payment selected');
-                } else {
-                    log.push('Card radio NOT FOUND');
+                    log.push('Card selected');
                 }
 
-                // 6. Чекбоксы
-                let cbCount = 0;
+                // 5. Чекбоксы
                 document.querySelectorAll('input[type=checkbox]').forEach(cb => {
                     if (!cb.checked) {
                         cb.checked = true;
                         cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        cbCount++;
                     }
                 });
-                log.push('Checkboxes: ' + cbCount);
+                log.push('Checkboxes done');
 
-                // 7. Ждём пересчёт суммы
-                await new Promise(r => setTimeout(r, 1500));
+                // 6. Кликаем "+" ПОСЛЕДНИМ — чтобы ничего не сбросило сумму
+                const plusBtn = document.querySelector('.chek_ticket_item .number .plus');
+                if (plusBtn) {
+                    plusBtn.click();
+                    log.push('Plus clicked');
+                } else {
+                    const inp = document.querySelector('.chek_ticket_item input');
+                    if (inp) {
+                        inp.value = '1';
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        log.push('Direct input=1');
+                    } else {
+                        return {error: 'No plus btn and no input', log};
+                    }
+                }
 
-                // 8. Итог
+                await new Promise(r => setTimeout(r, 1000));
+
+                // 7. Читаем сумму
                 const totalEl = document.querySelector('.summ_itog');
-                const total = totalEl ? totalEl.textContent.trim() : '?';
+                let total = totalEl ? totalEl.textContent.trim() : '?';
                 log.push('Total: ' + total);
 
-                // Проверяем значение input
+                // Fallback: если сумма 0, берём цену из карточки билета
+                if (total === '0 ₽' || total === '0') {
+                    const priceEl = document.querySelector('.chek_ticket_item .chek_ticket_price');
+                    if (priceEl) {
+                        total = priceEl.textContent.trim();
+                        log.push('Fallback price from card: ' + total);
+                    }
+                }
+
                 const inp = document.querySelector('.chek_ticket_item input');
                 log.push('Input value: ' + (inp ? inp.value : 'N/A'));
 
