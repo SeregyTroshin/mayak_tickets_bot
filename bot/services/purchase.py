@@ -102,6 +102,7 @@ async def prepare_purchase(
 
     pw = await async_playwright().start()
     browser = None
+    page = None
 
     try:
         browser = await pw.chromium.launch(
@@ -110,129 +111,260 @@ async def prepare_purchase(
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--single-process",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
-        page = await browser.new_page(
+        context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
-            )
+            ),
+            locale="ru-RU",
         )
+        # Stealth: скрыть headless-признаки от DDoS-Guard
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['ru-RU', 'ru', 'en-US', 'en']
+            });
+            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+            const origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : origQuery(parameters);
+        """)
+        page = await context.new_page()
 
-        log.info("Browser launched, loading page...")
-        await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-        log.info("DOM loaded, waiting for network idle...")
-
-        # Ждём пока JS обработает URL-параметры и сделает AJAX-вызовы
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-            log.info("Network idle")
-        except Exception:
-            log.warning("networkidle timeout — continuing anyway")
-
-        await page.wait_for_selector("#orderForm", timeout=10_000)
+        log.info("Browser launched (stealth), loading page...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        log.info("DOM loaded, waiting for orderForm...")
+        await page.wait_for_selector("#orderForm", timeout=30_000)
         log.info("orderForm found")
 
-        # Ждём появления билетных позиций (создаются JS после AJAX)
-        ticket_input = None
-        try:
-            ticket_input = await page.wait_for_selector(
-                ".chek_ticket_item input[type=text]", timeout=25_000
-            )
-        except Exception:
-            log.warning("Ticket items not found via selector, trying JS fallback")
+        # Дать странице время обработать JS (DDoS-Guard challenge + AJAX)
+        await page.wait_for_timeout(5000)
+        log.info("Filling form via JS evaluate...")
 
-        if not ticket_input:
-            # Fallback: возможно AJAX не сработал — попробуем вызвать JS вручную
-            # Сначала проверим, что получил AJAX
-            ajax_debug = await page.evaluate("""() => {
-                return {
-                    hasRanges: typeof ranges !== 'undefined' ? ranges.length : -1,
-                    hasPrices: typeof prices !== 'undefined' ? prices.length : -1,
-                    ticketItems: document.querySelectorAll('.chek_ticket_item').length,
-                    formHTML: document.getElementById('orderForm')
-                        ? document.getElementById('orderForm').innerHTML.substring(0, 500)
-                        : 'NO FORM',
-                };
-            }""")
-            log.info("AJAX debug: %s", ajax_debug)
+        # ── Всё заполняем через один page.evaluate() ──
+        # Это быстрее и надёжнее чем ждать AJAX страницы:
+        # мы сами делаем fetch(), парсим ответ, заполняем DOM.
+        js_result = await page.evaluate("""async (args) => {
+            const {stadiumId, date, timeRange, promo, name, phone, email} = args;
+            const log = [];
 
-            # Если ranges/prices загружены но get_prices не вызвался — вызовем
-            if ajax_debug.get("hasRanges", -1) > 0:
-                await page.evaluate("get_prices()")
-                await page.wait_for_timeout(1000)
-                ticket_input = await page.wait_for_selector(
-                    ".chek_ticket_item input[type=text]", timeout=5_000
-                )
+            try {
+                // 1. AJAX: получить сеансы и цены
+                const resp = await fetch(
+                    '/assets/ajax/get_ranges_hockey.php?stadium='
+                    + stadiumId + '&date=' + encodeURIComponent(date)
+                    + '&promo=' + encodeURIComponent(promo || '')
+                );
+                const data = await resp.json();
+                log.push('AJAX: ranges=' + (data.Ranges||[]).length
+                         + ' prices=' + (data.TicketPrices||[]).length);
 
-        if not ticket_input:
-            # Дампим HTML для диагностики
-            html_snippet = await page.evaluate(
-                "document.body.innerHTML.substring(0, 2000)"
-            )
-            log.error("No ticket items. Body: %s", html_snippet)
-            raise Exception("Билетные позиции не загрузились. Возможно, AJAX заблокирован.")
+                if (!data.Ranges || data.Ranges.length === 0) {
+                    // AJAX пустой — попробуем подождать пока страница сама загрузит
+                    log.push('AJAX empty, waiting for page JS...');
+                    for (let i = 0; i < 20; i++) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        const ti = document.querySelector('.chek_ticket_item input[type=text]');
+                        if (ti) {
+                            log.push('Page JS loaded ticket items after ' + (i+1) + 's');
+                            // Страница сама заполнила — работаем с тем что есть
+                            ti.value = '1';
+                            ti.dispatchEvent(new Event('change'));
+                            // Заполняем остальное и выходим
+                            if (promo) {
+                                const pi = document.querySelector('input[name="f_Promo"]')
+                                         || document.querySelector('#promocode');
+                                if (pi) pi.value = promo;
+                                const btn = document.querySelector('.apply_promo');
+                                if (btn) { btn.click(); await new Promise(r => setTimeout(r, 2000)); }
+                            }
+                            const fN = document.querySelector('input[name="f_Name"]');
+                            const fP = document.querySelector('input[name="f_Phone"]');
+                            const fE = document.querySelector('input[name="f_Email"]');
+                            if (fN) fN.value = name;
+                            if (fP) fP.value = phone;
+                            if (fE) fE.value = email;
+                            const cr = document.querySelector('#payment_2')
+                                || document.querySelector('input[name="payment_method"][value="2"]');
+                            if (cr) cr.checked = true;
+                            document.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true);
+                            await new Promise(r => setTimeout(r, 1000));
+                            const tot = document.querySelector('.summ_itog');
+                            return {success: true, total: tot ? tot.textContent.trim() : '?', log};
+                        }
+                    }
+                    // Так и не появились
+                    const bodySnip = document.body ? document.body.innerHTML.substring(0, 500) : 'no body';
+                    return {error: 'Билеты не загрузились (AJAX пустой, страница не заполнила)', log, html: bodySnip};
+                }
 
-        await ticket_input.fill("1")
-        await ticket_input.dispatch_event("change")
-        log.info("Ticket qty = 1")
+                // 2. Найти нужный сеанс
+                let target = null;
+                for (const r of data.Ranges) {
+                    if (r.NameRange === timeRange) { target = r; break; }
+                }
+                if (!target) {
+                    const names = data.Ranges.map(r => r.NameRange).join(', ');
+                    return {error: 'Сеанс "' + timeRange + '" не найден. Есть: ' + names, log};
+                }
+                log.push('Range found: type=' + target.Type
+                         + ' avail=' + target.AvailableTiickets);
 
-        # Промокод
-        if promo:
-            promo_input = page.locator('input[name="f_Promo"]')
-            if await promo_input.count() > 0:
-                await promo_input.fill(promo)
-            else:
-                # fallback на старый id
-                await page.locator("#promocode").fill(promo)
+                // 3. Найти цену билета для этого типа
+                const prices = data.TicketPrices || [];
+                let ticket = null;
+                for (const p of prices) {
+                    const pType = (p.Type == 10) ? 1 : p.Type;
+                    if (pType == target.Type) { ticket = p; break; }
+                }
+                if (!ticket) {
+                    return {error: 'Нет цены для типа ' + target.Type, log};
+                }
+                log.push('Ticket: id=' + ticket.IDService
+                         + ' name=' + ticket.NameService
+                         + ' price=' + ticket.Price);
 
-            apply_btn = page.locator(".apply_promo, .promo_button, button:has-text('Применить')")
-            if await apply_btn.count() > 0:
-                await apply_btn.first.click()
-                await page.wait_for_timeout(3000)
-            log.info("Promo applied: %s", promo)
+                // 4. Установить глобальные переменные страницы
+                window.ranges = data.Ranges;
+                window.prices = prices;
+                window.promo_quantity = data.PromoQuantity || 100;
 
-        # Контактные данные
-        await page.locator('input[name="f_Name"]').fill(name)
-        await page.locator('input[name="f_Phone"]').fill(phone)
-        await page.locator('input[name="f_Email"]').fill(email)
-        log.info("Contact info filled")
+                // 5. Установить dropdown сеанса и вызвать get_prices()
+                const $range = document.querySelector('#order_range');
+                if ($range) {
+                    // Добавить option если нет
+                    let found = false;
+                    for (const opt of $range.options) {
+                        if (opt.value === timeRange) {
+                            opt.selected = true;
+                            opt.dataset.type = target.Type;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        const opt = new Option(timeRange, timeRange, true, true);
+                        opt.dataset.type = String(target.Type);
+                        $range.add(opt);
+                    }
+                }
 
-        # Оплата картой — пробуем несколько селекторов
-        card_radio = page.locator("#payment_2")
-        if await card_radio.count() == 0:
-            card_radio = page.locator("input[name='payment_method'][value='2']")
-        if await card_radio.count() == 0:
-            card_radio = page.locator("label:has-text('Картой') input, label:has-text('картой') input")
-        if await card_radio.count() > 0:
-            await card_radio.first.check()
-            log.info("Card payment selected")
-        else:
-            log.warning("Card payment radio not found")
+                if (typeof get_prices === 'function') {
+                    get_prices();
+                    log.push('get_prices() called');
+                }
 
-        # Три галочки — пробуем несколько селекторов
-        for chk_id in ["#order_agree_oferta", "#order_agree_policy", "#order_agree_personal"]:
-            chk = page.locator(chk_id)
-            if await chk.count() > 0:
-                await chk.check()
-            else:
-                log.warning("Checkbox %s not found", chk_id)
-        # Fallback: отметить все видимые чекбоксы с agree в name/id
-        unchecked = page.locator("input[type=checkbox]:not(:checked)")
-        for i in range(await unchecked.count()):
-            try:
-                await unchecked.nth(i).check()
-            except Exception:
-                pass
-        log.info("Agreements checked")
+                await new Promise(r => setTimeout(r, 500));
 
-        # Считать сумму
-        await page.wait_for_timeout(2000)
-        total_amount = None
-        total_el = page.locator(".summ_itog")
-        if await total_el.count() > 0:
-            total_amount = (await total_el.text_content() or "").strip()
+                // 6. Установить количество = 1
+                const ticketInput = document.querySelector(
+                    '.chek_ticket_item input[type=text]'
+                );
+                if (ticketInput) {
+                    ticketInput.value = '1';
+                    ticketInput.dispatchEvent(new Event('change'));
+                    log.push('Ticket qty = 1');
+                } else {
+                    // Fallback: создать поле вручную
+                    const main = document.querySelector('.chek_ticket_main');
+                    if (main) {
+                        main.innerHTML =
+                            '<div class="chek_ticket_item">'
+                            + '<div class="chek_ticket_col1">'
+                            + '<div class="chek_ticket_head">' + ticket.NameService + '</div>'
+                            + '<div class="chek_ticket_price">' + ticket.Price + ' руб.</div>'
+                            + '</div>'
+                            + '<div class="chek_ticket_col2"><div class="number">'
+                            + '<input type="text" name="item[' + ticket.IDService + ']"'
+                            + ' data-id="' + ticket.IDService + '"'
+                            + ' data-name="' + ticket.NameService + '"'
+                            + ' data-price="' + ticket.Price + '"'
+                            + ' data-max="' + target.AvailableTiickets + '"'
+                            + ' value="1"/>'
+                            + '</div></div></div>';
+                        const inp = main.querySelector('input');
+                        if (inp) inp.dispatchEvent(new Event('change'));
+                        log.push('Ticket item created manually');
+                    } else {
+                        return {error: 'Нет .chek_ticket_main и нет ticket input', log};
+                    }
+                }
+
+                // 7. Промокод
+                if (promo) {
+                    const pi = document.querySelector('input[name="f_Promo"]')
+                             || document.querySelector('#promocode');
+                    if (pi) pi.value = promo;
+
+                    const btn = document.querySelector('.apply_promo')
+                             || document.querySelector('.promo_button');
+                    if (btn) {
+                        btn.click();
+                        await new Promise(r => setTimeout(r, 2000));
+                        log.push('Promo applied via button');
+                    }
+                }
+
+                // 8. Контактные данные
+                const fName = document.querySelector('input[name="f_Name"]');
+                const fPhone = document.querySelector('input[name="f_Phone"]');
+                const fEmail = document.querySelector('input[name="f_Email"]');
+                if (fName) fName.value = name;
+                if (fPhone) fPhone.value = phone;
+                if (fEmail) fEmail.value = email;
+                log.push('Contact filled');
+
+                // 9. Оплата картой
+                const cardRadio = document.querySelector('#payment_2')
+                    || document.querySelector('input[name="payment_method"][value="2"]');
+                if (cardRadio) { cardRadio.checked = true; log.push('Card selected'); }
+
+                // 10. Все чекбоксы
+                document.querySelectorAll('input[type=checkbox]').forEach(
+                    cb => { cb.checked = true; }
+                );
+                log.push('Checkboxes checked');
+
+                // 11. Пересчёт суммы
+                await new Promise(r => setTimeout(r, 1000));
+                const totalEl = document.querySelector('.summ_itog');
+                const total = totalEl ? totalEl.textContent.trim() : (ticket.Price + ' руб.');
+
+                return {success: true, total, log};
+
+            } catch (e) {
+                return {error: String(e), log};
+            }
+        }""", {
+            "stadiumId": stadium_id,
+            "date": date,
+            "timeRange": time_range,
+            "promo": promo or "",
+            "name": name,
+            "phone": phone,
+            "email": email,
+        })
+
+        js_log = js_result.get("log", [])
+        log.info("JS fill result: %s", js_log)
+
+        if not js_result.get("success"):
+            error = js_result.get("error", "Неизвестная ошибка JS")
+            html_snip = js_result.get("html", "")
+            log.error("JS fill failed: %s | HTML: %s", error, html_snip)
+            raise Exception(error)
+
+        total_amount = js_result.get("total")
         log.info("Total: %s", total_amount)
 
         session = PurchaseSession(pw, browser, page, total_amount, user_id)
@@ -242,10 +374,11 @@ async def prepare_purchase(
 
     except Exception as e:
         log.exception("prepare_purchase failed: %s", e)
-        # Дамп HTML страницы для диагностики
-        if browser and page:
+        if page:
             try:
-                body = await page.evaluate("document.body ? document.body.innerHTML.substring(0, 3000) : 'no body'")
+                body = await page.evaluate(
+                    "document.body ? document.body.innerHTML.substring(0, 3000) : 'no body'"
+                )
                 log.error("PAGE HTML: %s", body)
             except Exception:
                 pass
