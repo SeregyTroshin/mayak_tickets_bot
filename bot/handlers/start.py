@@ -104,51 +104,94 @@ async def cmd_debug(message: Message):
         }""")
         report.append(f"Page JS state: {json.dumps(state, ensure_ascii=False)}")
 
-        # Check all inputs inside ticket items
-        inputs_info = await page.evaluate("""() => {
-            const items = document.querySelectorAll('.chek_ticket_item');
+        # Test clicking "+" and see what happens
+        click_test = await page.evaluate("""async () => {
             const result = [];
-            items.forEach((item, i) => {
-                const inputs = item.querySelectorAll('input');
-                inputs.forEach((inp, j) => {
-                    result.push('item' + i + '_inp' + j + ': type=' + inp.type + ' name=' + inp.name + ' class=' + inp.className + ' value=' + inp.value);
-                });
-                // Also check for number div structure
-                const numDiv = item.querySelector('.number');
-                result.push('item' + i + '_numDiv: ' + (numDiv ? numDiv.innerHTML.substring(0, 200) : 'NONE'));
-            });
-            // Check contact fields
-            const fName = document.querySelector('input[name="f_Name"]');
-            const fPhone = document.querySelector('input[name="f_Phone"]');
-            const fEmail = document.querySelector('input[name="f_Email"]');
-            result.push('f_Name: ' + (fName ? 'YES' : 'NO'));
-            result.push('f_Phone: ' + (fPhone ? 'YES' : 'NO'));
-            result.push('f_Email: ' + (fEmail ? 'YES' : 'NO'));
-            // Check promo
-            const promo = document.querySelector('input[name="f_Promo"]') || document.querySelector('#promocode');
-            result.push('promo: ' + (promo ? 'YES tag=' + promo.tagName + ' name=' + promo.name : 'NO'));
-            // Check payment radio
-            const pay2 = document.querySelector('#payment_2');
-            result.push('payment_2: ' + (pay2 ? 'YES type=' + pay2.type : 'NO'));
-            // Check submit
-            const submit = document.querySelector('button[type="submit"], input[type="submit"], .order_submit');
-            result.push('submit: ' + (submit ? 'YES tag=' + submit.tagName + ' text=' + (submit.textContent||'').substring(0, 50) : 'NO'));
-            // Check total
-            const total = document.querySelector('.summ_itog');
-            result.push('summ_itog: ' + (total ? total.textContent : 'NO'));
+
+            // Before click
+            const inp = document.querySelector('.chek_ticket_item input');
+            result.push('BEFORE: value=' + (inp ? inp.value : 'N/A'));
+            const total1 = document.querySelector('.summ_itog');
+            result.push('BEFORE total: ' + (total1 ? total1.textContent : 'N/A'));
+
+            // Find plus button
+            const plus = document.querySelector('.chek_ticket_item .number .plus');
+            result.push('Plus btn: ' + (plus ? 'FOUND tag=' + plus.tagName : 'NOT FOUND'));
+
+            // Check event listeners - look at onclick
+            if (plus) {
+                result.push('Plus onclick: ' + (plus.onclick ? String(plus.onclick).substring(0, 100) : 'null'));
+                result.push('Plus parent: ' + plus.parentElement.className);
+
+                // Try clicking
+                plus.click();
+                await new Promise(r => setTimeout(r, 500));
+                result.push('AFTER click: value=' + (inp ? inp.value : 'N/A'));
+            }
+
+            // Check for jQuery events on plus
+            if (typeof jQuery !== 'undefined' || typeof $ !== 'undefined') {
+                result.push('jQuery: YES');
+                try {
+                    const jq = jQuery || $;
+                    const events = jq._data(plus, 'events') || {};
+                    result.push('Plus jQuery events: ' + Object.keys(events).join(','));
+                } catch(e) {
+                    result.push('jQuery events error: ' + e);
+                }
+            } else {
+                result.push('jQuery: NO');
+            }
+
+            // Check for common calc functions
+            const fns = ['calc_summ', 'calcSumm', 'calculate', 'calculateSum',
+                         'update_total', 'updateTotal', 'calc_total', 'calcTotal',
+                         'recalc', 'get_prices', 'getPrices', 'calc_order',
+                         'check_summ', 'checkSumm'];
+            const found = fns.filter(f => typeof window[f] === 'function');
+            result.push('Global functions: ' + (found.length ? found.join(', ') : 'NONE'));
+
+            // Try calling found functions
+            for (const f of found) {
+                try {
+                    window[f]();
+                    result.push('Called ' + f + '()');
+                } catch(e) {
+                    result.push(f + '() error: ' + e);
+                }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+
+            const total2 = document.querySelector('.summ_itog');
+            result.push('AFTER funcs total: ' + (total2 ? total2.textContent : 'N/A'));
+
+            // Try setting value directly and triggering events
+            if (inp && inp.value === '0') {
+                inp.value = '1';
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                inp.dispatchEvent(new Event('change', {bubbles: true}));
+                inp.dispatchEvent(new Event('keyup', {bubbles: true}));
+                inp.dispatchEvent(new Event('blur', {bubbles: true}));
+
+                // Try calc functions again
+                for (const f of found) {
+                    try { window[f](); } catch(e) {}
+                }
+                await new Promise(r => setTimeout(r, 1000));
+                const total3 = document.querySelector('.summ_itog');
+                result.push('AFTER direct set total: ' + (total3 ? total3.textContent : 'N/A'));
+                result.push('Input value now: ' + inp.value);
+            }
+
+            // Dump all script src
+            const scripts = document.querySelectorAll('script[src]');
+            const srcs = [];
+            scripts.forEach(s => srcs.push(s.src.split('/').pop()));
+            result.push('Scripts: ' + srcs.join(', '));
+
             return result;
         }""")
-        report.append(f"Inputs: {json.dumps(inputs_info, ensure_ascii=False)}")
-
-        # Check select#order_range options
-        range_info = await page.evaluate("""() => {
-            const sel = document.querySelector('#order_range');
-            if (!sel) return 'no #order_range';
-            const opts = [];
-            for (const o of sel.options) opts.push(o.value + ' (type=' + (o.dataset.type||'?') + ')');
-            return 'options: ' + opts.join(', ');
-        }""")
-        report.append(f"order_range: {range_info}")
+        report.append(f"Click test: {json.dumps(click_test, ensure_ascii=False)}")
 
         await browser.close()
         await pw.stop()
