@@ -104,7 +104,14 @@ async def prepare_purchase(
     browser = None
 
     try:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         page = await browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -113,8 +120,10 @@ async def prepare_purchase(
             )
         )
 
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
-        await page.wait_for_selector("#orderForm", timeout=10_000)
+        log.info("Browser launched, loading page...")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        log.info("DOM loaded, waiting for form...")
+        await page.wait_for_selector("#orderForm", timeout=20_000)
         log.info("Page loaded: %s", url)
 
         # 1 билет
