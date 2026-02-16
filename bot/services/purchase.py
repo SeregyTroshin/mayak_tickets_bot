@@ -79,6 +79,7 @@ async def prepare_purchase(
     date: str,
     time_range: str,
     promo: str | None,
+    person_name: str,
     name: str,
     phone: str,
     email: str,
@@ -155,24 +156,64 @@ async def prepare_purchase(
         # Все действия в одном evaluate — не зависает на ожидании видимости.
         # Кликаем "+" через JS element.click() — триггерит обработчики сайта.
 
+        # Определяем ключевое слово для поиска типа билета после применения промокода
+        # Тренер → "тренер", Ребёнок → "ребен", Катерина (без промо) → "каток"
+        if "тренер" in person_name.lower():
+            ticket_keyword = "тренер"
+        elif "ребён" in person_name.lower() or "ребен" in person_name.lower():
+            ticket_keyword = "ребен"
+        else:
+            ticket_keyword = "каток"
+
         js_result = await page.evaluate("""async (args) => {
-            const {promo, name, phone, email} = args;
+            const {promo, ticketKeyword, name, phone, email} = args;
             const log = [];
 
             try {
-                // 1. Промокод ПЕРВЫМ — он сбрасывает количество билетов
+                // 1. Промокод ПЕРВЫМ — он меняет типы билетов
                 if (promo) {
                     const pi = document.querySelector('input[name="f_Promo"]');
                     if (pi) pi.value = promo;
                     const btn = document.querySelector('.apply_promo');
                     if (btn) {
                         btn.click();
-                        await new Promise(r => setTimeout(r, 2500));
+                        await new Promise(r => setTimeout(r, 3000));
                         log.push('Promo applied');
                     }
                 }
 
-                // 2. Контакты
+                // Посмотреть какие билеты есть после промокода
+                const items = document.querySelectorAll('.chek_ticket_item');
+                const names = [];
+                items.forEach(item => {
+                    const head = item.querySelector('.chek_ticket_head');
+                    if (head) names.push(head.textContent.trim());
+                });
+                log.push('Tickets: ' + names.join(', '));
+
+                // 2. Найти нужный тип билета по ключевому слову
+                let targetItem = null;
+                items.forEach(item => {
+                    const head = item.querySelector('.chek_ticket_head');
+                    if (head && head.textContent.toLowerCase().includes(ticketKeyword)) {
+                        targetItem = item;
+                    }
+                });
+
+                if (!targetItem && items.length > 0) {
+                    // Fallback: первый билет
+                    targetItem = items[0];
+                    log.push('Fallback to first item');
+                }
+
+                if (!targetItem) {
+                    return {error: 'Билеты не найдены на странице', log};
+                }
+
+                const head = targetItem.querySelector('.chek_ticket_head');
+                log.push('Selected: ' + (head ? head.textContent.trim() : '?'));
+
+                // 3. Контакты
                 const setField = (n, v) => {
                     const el = document.querySelector('input[name="' + n + '"]');
                     if (el) el.value = v;
@@ -181,14 +222,14 @@ async def prepare_purchase(
                 setField('f_Phone', phone);
                 setField('f_Email', email);
 
-                // 3. Оплата картой
+                // 4. Оплата картой
                 const radio = document.querySelector('#payment_2');
                 if (radio) {
                     radio.checked = true;
                     radio.dispatchEvent(new Event('change', {bubbles: true}));
                 }
 
-                // 4. Чекбоксы
+                // 5. Чекбоксы
                 document.querySelectorAll('input[type=checkbox]').forEach(cb => {
                     if (!cb.checked) {
                         cb.checked = true;
@@ -196,18 +237,27 @@ async def prepare_purchase(
                     }
                 });
 
-                // 5. Кликаем "+" ПОСЛЕДНИМ — после промокода и всех полей
-                const plusBtn = document.querySelector('.chek_ticket_item .number .plus');
+                // 6. Кликаем "+" на НУЖНОМ билете — ПОСЛЕДНИМ
+                const plusBtn = targetItem.querySelector('.number .plus');
                 if (plusBtn) {
                     plusBtn.click();
                     log.push('Plus clicked');
                 } else {
-                    return {error: 'Кнопка + не найдена', log};
+                    // Fallback: установить input напрямую
+                    const inp = targetItem.querySelector('input');
+                    if (inp) {
+                        inp.value = '1';
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        log.push('Direct input=1');
+                    } else {
+                        return {error: 'Ни +, ни input в билете', log};
+                    }
                 }
 
                 await new Promise(r => setTimeout(r, 1000));
 
-                // 6. Сумма
+                // 7. Сумма
                 const totalEl = document.querySelector('.summ_itog');
                 const total = totalEl ? totalEl.textContent.trim() : '?';
                 log.push('Total: ' + total);
@@ -219,6 +269,7 @@ async def prepare_purchase(
             }
         }""", {
             "promo": promo or "",
+            "ticketKeyword": ticket_keyword,
             "name": name,
             "phone": phone,
             "email": email,

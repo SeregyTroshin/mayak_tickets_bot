@@ -216,6 +216,7 @@ async def select_person(callback: CallbackQuery, state: FSMContext):
         date=date,
         time_range=time_range,
         promo=person.promo,
+        person_name=person.name,
         name=config.customer_name,
         phone=config.customer_phone,
         email=config.customer_email,
