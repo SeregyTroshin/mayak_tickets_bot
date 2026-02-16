@@ -156,72 +156,39 @@ async def prepare_purchase(
         # Кликаем "+" через JS element.click() — триггерит обработчики сайта.
 
         js_result = await page.evaluate("""async (args) => {
-            const {timeRange, promo, name, phone, email} = args;
+            const {promo, name, phone, email} = args;
             const log = [];
 
-            // Утилита: текущее состояние
-            const state = () => {
-                const inp = document.querySelector('.chek_ticket_item input');
-                const tot = document.querySelector('.summ_itog');
-                const plus = document.querySelector('.chek_ticket_item .number .plus');
-                return 'inp=' + (inp ? inp.value : 'N/A')
-                     + ' total=' + (tot ? tot.textContent.trim() : 'N/A')
-                     + ' plus=' + (plus ? 'Y' : 'N')
-                     + ' items=' + document.querySelectorAll('.chek_ticket_item').length;
-            };
-
             try {
-                log.push('START: ' + state());
-
-                // 1. НЕ трогаем dropdown — URL уже задал сеанс
-                // Просто логируем текущий выбор
-                const sel = document.querySelector('#order_range');
-                if (sel) {
-                    log.push('Range current: ' + sel.value);
-                }
-
-                // 2. Сначала просто кликаем "+" и проверяем
-                const plusBtn = document.querySelector('.chek_ticket_item .number .plus');
-                if (plusBtn) {
-                    plusBtn.click();
-                    await new Promise(r => setTimeout(r, 500));
-                    log.push('AFTER plus click: ' + state());
-                } else {
-                    log.push('NO plus btn!');
-                }
-
-                // 3. Промокод
+                // 1. Промокод ПЕРВЫМ — он сбрасывает количество билетов
                 if (promo) {
                     const pi = document.querySelector('input[name="f_Promo"]');
-                    if (pi) {
-                        pi.value = promo;
-                        pi.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
+                    if (pi) pi.value = promo;
                     const btn = document.querySelector('.apply_promo');
                     if (btn) {
                         btn.click();
-                        await new Promise(r => setTimeout(r, 2000));
-                        log.push('AFTER promo: ' + state());
+                        await new Promise(r => setTimeout(r, 2500));
+                        log.push('Promo applied');
                     }
                 }
 
-                // 4. Контакты
-                const setField = (fname, val) => {
-                    const el = document.querySelector('input[name="' + fname + '"]');
-                    if (el) el.value = val;
+                // 2. Контакты
+                const setField = (n, v) => {
+                    const el = document.querySelector('input[name="' + n + '"]');
+                    if (el) el.value = v;
                 };
                 setField('f_Name', name);
                 setField('f_Phone', phone);
                 setField('f_Email', email);
 
-                // 5. Оплата картой
+                // 3. Оплата картой
                 const radio = document.querySelector('#payment_2');
                 if (radio) {
                     radio.checked = true;
                     radio.dispatchEvent(new Event('change', {bubbles: true}));
                 }
 
-                // 6. Чекбоксы
+                // 4. Чекбоксы
                 document.querySelectorAll('input[type=checkbox]').forEach(cb => {
                     if (!cb.checked) {
                         cb.checked = true;
@@ -229,31 +196,21 @@ async def prepare_purchase(
                     }
                 });
 
-                log.push('AFTER all fields: ' + state());
-
-                // 7. Если сумма сбросилась — кликнуть "+" ещё раз
-                const tot1 = document.querySelector('.summ_itog');
-                if (tot1 && (tot1.textContent.trim() === '0 ₽' || tot1.textContent.trim() === '0')) {
-                    log.push('Total is 0, re-clicking plus...');
-                    const plus2 = document.querySelector('.chek_ticket_item .number .plus');
-                    if (plus2) {
-                        plus2.click();
-                        await new Promise(r => setTimeout(r, 1000));
-                        log.push('AFTER re-click: ' + state());
-                    }
+                // 5. Кликаем "+" ПОСЛЕДНИМ — после промокода и всех полей
+                const plusBtn = document.querySelector('.chek_ticket_item .number .plus');
+                if (plusBtn) {
+                    plusBtn.click();
+                    log.push('Plus clicked');
+                } else {
+                    return {error: 'Кнопка + не найдена', log};
                 }
 
-                // 8. Финальная сумма
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 1000));
+
+                // 6. Сумма
                 const totalEl = document.querySelector('.summ_itog');
-                let total = totalEl ? totalEl.textContent.trim() : '?';
-
-                // Fallback
-                if (total === '0 ₽' || total === '0') {
-                    const priceEl = document.querySelector('.chek_ticket_item .chek_ticket_price');
-                    if (priceEl) total = priceEl.textContent.trim();
-                    log.push('Fallback price: ' + total);
-                }
+                const total = totalEl ? totalEl.textContent.trim() : '?';
+                log.push('Total: ' + total);
 
                 return {success: true, total, log};
 
@@ -261,7 +218,6 @@ async def prepare_purchase(
                 return {error: String(e), log};
             }
         }""", {
-            "timeRange": time_range,
             "promo": promo or "",
             "name": name,
             "phone": phone,
@@ -278,10 +234,6 @@ async def prepare_purchase(
             raise Exception(error)
 
         total_amount = js_result.get("total")
-        # Временно: добавить лог в сумму для отладки
-        debug_info = " | ".join(js_log[-4:]) if js_log else ""
-        if debug_info:
-            total_amount = f"{total_amount}\n[{debug_info}]"
         log.info("Total: %s, log: %s", total_amount, js_log)
 
         session = PurchaseSession(pw, browser, page, total_amount, user_id)
